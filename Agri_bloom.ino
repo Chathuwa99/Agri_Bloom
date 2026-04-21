@@ -1,8 +1,20 @@
-#include <Wire.h>
-#include <BH1750.h>
-#include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <BH1750.h>
+#include <DHT.h>
+#include <FirebaseESP32.h>
+#include <WiFi.h>
+#include <Wire.h>
+
+
+#define WIFI_SSID "ESP32"
+#define WIFI_PASSWORD "AgriBloom123#"
+#define FIREBASE_HOST "agri-bloom-59b2a-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyDo20_bhC1QcwWB86yiZA2mjvo9uDw1aC8"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
 
 #define DHTPIN 18
 #define DHTTYPE DHT22
@@ -24,11 +36,11 @@
 #define SOIL_SAMPLES 30
 
 // -------------------- TIMERS --------------------
-const unsigned long STARTUP_DURATION   = 5000;   // 5 sec startup screen
-const unsigned long SCREEN_DURATION    = 5000;   // 5 sec per OLED screen
-const unsigned long SENSOR_INTERVAL    = 30000;  // 30 sec sensor read/print
-const unsigned long WATERING_DURATION  = 5000;   // 5 sec motor ON
-const unsigned long WATERING_COOLDOWN  = 55000;  // 55 sec wait after watering
+const unsigned long STARTUP_DURATION = 5000;   // 5 sec startup screen
+const unsigned long SCREEN_DURATION = 5000;    // 5 sec per OLED screen
+const unsigned long SENSOR_INTERVAL = 30000;   // 30 sec sensor read/print
+const unsigned long WATERING_DURATION = 5000;  // 5 sec motor ON
+const unsigned long WATERING_COOLDOWN = 55000; // 55 sec wait after watering
 
 DHT dht(DHTPIN, DHTTYPE);
 BH1750 lightMeter;
@@ -59,6 +71,28 @@ float latestLux = 0.0;
 int latestRawSoil = 0;
 bool latestPumpOn = false;
 
+const String DEVICE_PATH = "/AgriBloom/device_001";
+
+unsigned long configuredWateringDuration = WATERING_DURATION;
+bool autoWateringEnabled = true;
+bool manualWaterRequested = false;
+
+float thresholdSoilMin = 60.0;
+float thresholdSoilMax = 70.0;
+float thresholdTempMin = 18.0;
+float thresholdTempMax = 27.0;
+float thresholdHumidityMin = 50.0;
+float thresholdHumidityMax = 80.0;
+float thresholdLightMin = 5000.0;
+float thresholdLightMax = 5500.0;
+
+unsigned long lastSoilAlertAt = 0;
+unsigned long lastTempAlertAt = 0;
+unsigned long lastHumidityAlertAt = 0;
+unsigned long lastLightAlertAt = 0;
+unsigned long lastDiagnosisAlertAt = 0;
+const unsigned long ALERT_THROTTLE = 120000;
+
 // -------------------- HELPERS --------------------
 
 int readAveragedAnalog(int pin, int samples) {
@@ -71,11 +105,14 @@ int readAveragedAnalog(int pin, int samples) {
 }
 
 float getMoisturePct(int rawSoil) {
-  float moisturePct = ((float)(SOIL_DRY_VALUE - rawSoil) /
-                       (SOIL_DRY_VALUE - SOIL_WET_VALUE)) * 100.0;
+  float moisturePct =
+      ((float)(SOIL_DRY_VALUE - rawSoil) / (SOIL_DRY_VALUE - SOIL_WET_VALUE)) *
+      100.0;
 
-  if (moisturePct < 0) moisturePct = 0;
-  if (moisturePct > 100) moisturePct = 100;
+  if (moisturePct < 0)
+    moisturePct = 0;
+  if (moisturePct > 100)
+    moisturePct = 100;
 
   return moisturePct;
 }
@@ -94,43 +131,37 @@ String diagnosePlant(float moisturePct, float lux, float temp, float hum) {
     return "Water Stress";
   }
 
-  if (moisturePct >= 85.0 && moisturePct <= 100.0 &&
-      lux >= 500.0 && lux <= 2000.0 &&
-      temp >= 18.0 && temp <= 26.0 &&
-      hum >= 80.0 && hum <= 95.0) {
+  if (moisturePct >= 85.0 && moisturePct <= 100.0 && lux >= 500.0 &&
+      lux <= 2000.0 && temp >= 18.0 && temp <= 26.0 && hum >= 80.0 &&
+      hum <= 95.0) {
     return "Root Rot Risk";
   }
 
-  if (moisturePct >= 30.0 && moisturePct <= 55.0 &&
-      temp >= 32.0 && temp <= 42.0 &&
-      hum >= 20.0 && hum <= 40.0) {
+  if (moisturePct >= 30.0 && moisturePct <= 55.0 && temp >= 32.0 &&
+      temp <= 42.0 && hum >= 20.0 && hum <= 40.0) {
     return "Heat Stress";
   }
 
-  if (moisturePct >= 60.0 && moisturePct <= 80.0 &&
-      lux >= 300.0 && lux <= 1500.0 &&
-      temp >= 18.0 && temp <= 25.0 &&
-      hum >= 85.0 && hum <= 100.0) {
+  if (moisturePct >= 60.0 && moisturePct <= 80.0 && lux >= 300.0 &&
+      lux <= 1500.0 && temp >= 18.0 && temp <= 25.0 && hum >= 85.0 &&
+      hum <= 100.0) {
     return "Fungal Risk";
   }
 
-  if (moisturePct >= 50.0 && moisturePct <= 70.0 &&
-      lux >= 100.0 && lux <= 999.0 &&
-      temp >= 15.0 && temp <= 25.0) {
+  if (moisturePct >= 50.0 && moisturePct <= 70.0 && lux >= 100.0 &&
+      lux <= 999.0 && temp >= 15.0 && temp <= 25.0) {
     return "Light Deficiency";
   }
 
-  if (moisturePct >= 60.0 && moisturePct <= 70.0 &&
-      lux >= 3000.0 && lux <= 5000.0 &&
-      temp >= 18.0 && temp <= 27.0 &&
-      hum >= 60.0 && hum <= 80.0) {
+  if (moisturePct >= 60.0 && moisturePct <= 70.0 && lux >= 3000.0 &&
+      lux <= 5000.0 && temp >= 18.0 && temp <= 27.0 && hum >= 60.0 &&
+      hum <= 80.0) {
     return "Healthy";
   }
 
-  if (moisturePct >= 40.0 && moisturePct <= 70.0 &&
-      lux >= 500.0 && lux <= 4500.0 &&
-      temp >= 18.0 && temp <= 27.0 &&
-      hum >= 40.0 && hum <= 85.0) {
+  if (moisturePct >= 40.0 && moisturePct <= 70.0 && lux >= 500.0 &&
+      lux <= 4500.0 && temp >= 18.0 && temp <= 27.0 && hum >= 40.0 &&
+      hum <= 85.0) {
     return "Nutrient Deficiency";
   }
 
@@ -138,12 +169,8 @@ String diagnosePlant(float moisturePct, float lux, float temp, float hum) {
 }
 
 bool isRiskDiagnosis(String diagnosis) {
-  return (
-    diagnosis == "Water Stress" ||
-    diagnosis == "Root Rot Risk" ||
-    diagnosis == "Heat Stress" ||
-    diagnosis == "Fungal Risk"
-  );
+  return (diagnosis == "Water Stress" || diagnosis == "Root Rot Risk" ||
+          diagnosis == "Heat Stress" || diagnosis == "Fungal Risk");
 }
 
 String getRecommendation(String diagnosis, bool wateringNow, bool cooldownNow) {
@@ -174,6 +201,174 @@ String getRecommendation(String diagnosis, bool wateringNow, bool cooldownNow) {
   return "Monitor conditions";
 }
 
+int computeHealthScore(String currentDiagnosis, float moisturePct, float temp, float hum,
+                       float lux) {
+  int score = 100;
+
+  if (currentDiagnosis == "Water Stress")
+    score -= 28;
+  else if (currentDiagnosis == "Root Rot Risk")
+    score -= 30;
+  else if (currentDiagnosis == "Heat Stress")
+    score -= 24;
+  else if (currentDiagnosis == "Fungal Risk")
+    score -= 26;
+  else if (currentDiagnosis == "Light Deficiency")
+    score -= 16;
+  else if (currentDiagnosis == "Nutrient Deficiency")
+    score -= 14;
+  else if (currentDiagnosis == "Unknown")
+    score -= 20;
+
+  if (moisturePct < thresholdSoilMin)
+    score -= 6;
+  if (moisturePct > thresholdSoilMax)
+    score -= 6;
+  if (temp < thresholdTempMin)
+    score -= 5;
+  if (temp > thresholdTempMax)
+    score -= 8;
+  if (hum < thresholdHumidityMin || hum > thresholdHumidityMax)
+    score -= 5;
+  if (lux < thresholdLightMin || lux > thresholdLightMax)
+    score -= 5;
+
+  if (score < 0)
+    score = 0;
+  if (score > 100)
+    score = 100;
+
+  return score;
+}
+
+bool shouldSendAlert(unsigned long &lastSentAt, unsigned long now) {
+  if (now - lastSentAt < ALERT_THROTTLE) {
+    return false;
+  }
+
+  lastSentAt = now;
+  return true;
+}
+
+void pushAlertToFirebase(String type, String sensor, String message, String value,
+                         unsigned long now) {
+  String alertId = String(now) + "_" + String(random(100, 999));
+  String basePath = DEVICE_PATH + "/alerts/" + alertId;
+
+  Firebase.setString(fbdo, basePath + "/type", type);
+  Firebase.setString(fbdo, basePath + "/sensor", sensor);
+  Firebase.setString(fbdo, basePath + "/message", message);
+  Firebase.setString(fbdo, basePath + "/value", value);
+  Firebase.setString(fbdo, basePath + "/time", "T+" + String(now / 1000) + "s");
+  Firebase.setInt(fbdo, basePath + "/createdAt", now);
+  Firebase.setBool(fbdo, basePath + "/acknowledged", false);
+}
+
+void pushHistorySnapshot(unsigned long now, int healthScore) {
+  String pointPath = DEVICE_PATH + "/history/" + String(now);
+
+  if (!isnan(latestTemp))
+    Firebase.setFloat(fbdo, pointPath + "/temperature", latestTemp);
+  if (!isnan(latestHum))
+    Firebase.setFloat(fbdo, pointPath + "/humidity", latestHum);
+  Firebase.setFloat(fbdo, pointPath + "/moisturePct", latestMoisturePct);
+  Firebase.setFloat(fbdo, pointPath + "/lux", latestLux);
+  Firebase.setInt(fbdo, pointPath + "/health", healthScore);
+  Firebase.setString(fbdo, pointPath + "/diagnosis", diagnosis);
+  Firebase.setBool(fbdo, pointPath + "/pumpActive", latestPumpOn);
+  Firebase.setInt(fbdo, pointPath + "/createdAt", now);
+}
+
+void syncControlAndSettings() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (Firebase.getBool(fbdo, DEVICE_PATH + "/control/autoWatering")) {
+    autoWateringEnabled = fbdo.boolData();
+  }
+
+  if (Firebase.getInt(fbdo, DEVICE_PATH + "/control/pumpDurationSeconds")) {
+    int seconds = fbdo.intData();
+    if (seconds >= 1 && seconds <= 12) {
+      configuredWateringDuration = (unsigned long)seconds * 1000UL;
+    }
+  }
+
+  if (Firebase.getBool(fbdo, DEVICE_PATH + "/control/manualWaterNow")) {
+    manualWaterRequested = fbdo.boolData();
+  }
+
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMin")) {
+    thresholdSoilMin = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMax")) {
+    thresholdSoilMax = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMin")) {
+    thresholdTempMin = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMax")) {
+    thresholdTempMax = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/humidityMin")) {
+    thresholdHumidityMin = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/humidityMax")) {
+    thresholdHumidityMax = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMin")) {
+    thresholdLightMin = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMax")) {
+    thresholdLightMax = fbdo.floatData();
+  }
+}
+
+void evaluateAndPushAlerts(unsigned long now) {
+  if (latestMoisturePct < thresholdSoilMin &&
+      shouldSendAlert(lastSoilAlertAt, now)) {
+    pushAlertToFirebase("warning", "Soil Moisture",
+                        "Soil moisture is below optimal range",
+                        String(latestMoisturePct, 1) +
+                            " (Threshold: " + String(thresholdSoilMin, 1) + ")",
+                        now);
+  }
+
+  if (!isnan(latestTemp) && latestTemp > thresholdTempMax &&
+      shouldSendAlert(lastTempAlertAt, now)) {
+    pushAlertToFirebase("critical", "Temperature",
+                        "Temperature is above safe threshold",
+                        String(latestTemp, 1) +
+                            " (Threshold: " + String(thresholdTempMax, 1) + ")",
+                        now);
+  }
+
+  if (!isnan(latestHum) &&
+      (latestHum < thresholdHumidityMin || latestHum > thresholdHumidityMax) &&
+      shouldSendAlert(lastHumidityAlertAt, now)) {
+    pushAlertToFirebase("warning", "Humidity",
+                        "Humidity is outside configured range",
+                        String(latestHum, 1) + " (Range: " +
+                            String(thresholdHumidityMin, 1) + "-" +
+                            String(thresholdHumidityMax, 1) + ")",
+                        now);
+  }
+
+  if (latestLux < thresholdLightMin && shouldSendAlert(lastLightAlertAt, now)) {
+    pushAlertToFirebase("warning", "Light",
+                        "Light intensity dropped below minimum",
+                        String(latestLux, 0) +
+                            " (Threshold: " + String(thresholdLightMin, 0) + ")",
+                        now);
+  }
+
+  if (isRiskDiagnosis(diagnosis) && shouldSendAlert(lastDiagnosisAlertAt, now)) {
+    pushAlertToFirebase("critical", "Diagnosis",
+                        "Plant risk detected by diagnosis engine", diagnosis, now);
+  }
+}
+
 // -------------------- BUZZERS --------------------
 
 void beepRiskAlert() {
@@ -192,7 +387,8 @@ void beepWateringAlert() {
 }
 
 void handleBuzzerAlerts(String currentDiagnosis, bool pumpOn) {
-  bool newRisk = isRiskDiagnosis(currentDiagnosis) && !isRiskDiagnosis(lastDiagnosis);
+  bool newRisk =
+      isRiskDiagnosis(currentDiagnosis) && !isRiskDiagnosis(lastDiagnosis);
   bool wateringStarted = pumpOn && !lastPumpOn;
 
   if (newRisk) {
@@ -210,11 +406,13 @@ void handleBuzzerAlerts(String currentDiagnosis, bool pumpOn) {
 // -------------------- SERIAL --------------------
 
 void printLine() {
-  Serial.println("============================================================");
+  Serial.println(
+      "============================================================");
 }
 
 void printSection() {
-  Serial.println("------------------------------------------------------------");
+  Serial.println(
+      "------------------------------------------------------------");
 }
 
 void printSensorData() {
@@ -223,12 +421,16 @@ void printSensorData() {
   printLine();
 
   Serial.print("temperature   : ");
-  if (isnan(latestTemp)) Serial.println("null");
-  else Serial.println(latestTemp, 2);
+  if (isnan(latestTemp))
+    Serial.println("null");
+  else
+    Serial.println(latestTemp, 2);
 
   Serial.print("humidity_pct  : ");
-  if (isnan(latestHum)) Serial.println("null");
-  else Serial.println(latestHum, 2);
+  if (isnan(latestHum))
+    Serial.println("null");
+  else
+    Serial.println(latestHum, 2);
 
   Serial.print("raw_soil      : ");
   Serial.println(latestRawSoil);
@@ -275,9 +477,7 @@ void drawCenteredText(String text, int y, int size) {
   display.print(text);
 }
 
-void drawFrame() {
-  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE);
-}
+void drawFrame() { display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE); }
 
 void showStartupScreen() {
   display.clearDisplay();
@@ -299,12 +499,16 @@ void showTempHumidityScreen(float temp, float hum) {
   drawFrame();
 
   drawCenteredText("TEMPERATURE", 4, 1);
-  if (isnan(temp)) drawCenteredText("NULL", 18, 2);
-  else drawCenteredText(String((int)temp) + " C", 18, 2);
+  if (isnan(temp))
+    drawCenteredText("NULL", 18, 2);
+  else
+    drawCenteredText(String((int)temp) + " C", 18, 2);
 
   drawCenteredText("HUMIDITY", 42, 1);
-  if (isnan(hum)) drawCenteredText("NULL", 54, 1);
-  else drawCenteredText(String((int)hum) + " %", 54, 1);
+  if (isnan(hum))
+    drawCenteredText("NULL", 54, 1);
+  else
+    drawCenteredText(String((int)hum) + " %", 54, 1);
 
   display.display();
 }
@@ -415,23 +619,24 @@ void updateOLED(float temp, float hum, float moisturePct, float lux,
 
   if (now - screenTimer >= SCREEN_DURATION) {
     currentScreen++;
-    if (currentScreen > 5) currentScreen = 2;
+    if (currentScreen > 5)
+      currentScreen = 2;
     screenTimer = now;
   }
 
   switch (currentScreen) {
-    case 2:
-      showTempHumidityScreen(temp, hum);
-      break;
-    case 3:
-      showMoistureLuxScreen(moisturePct, lux);
-      break;
-    case 4:
-      showDiagnosisScreen(diagnosis);
-      break;
-    case 5:
-      showRecommendationScreen(recommendation);
-      break;
+  case 2:
+    showTempHumidityScreen(temp, hum);
+    break;
+  case 3:
+    showMoistureLuxScreen(moisturePct, lux);
+    break;
+  case 4:
+    showDiagnosisScreen(diagnosis);
+    break;
+  case 5:
+    showRecommendationScreen(recommendation);
+    break;
   }
 }
 
@@ -442,7 +647,7 @@ void startWatering(unsigned long now) {
   cooldownActive = false;
   wateringStartTime = now;
   latestPumpOn = true;
-  digitalWrite(PUMP_PIN, HIGH);   // change to LOW if your module is inverted
+  digitalWrite(PUMP_PIN, HIGH); // change to LOW if your module is inverted
 }
 
 void stopWateringAndStartCooldown(unsigned long now) {
@@ -450,12 +655,12 @@ void stopWateringAndStartCooldown(unsigned long now) {
   cooldownActive = true;
   cooldownStartTime = now;
   latestPumpOn = false;
-  digitalWrite(PUMP_PIN, LOW);    // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW); // change to HIGH if your module is inverted
 }
 
 void forcePumpOff() {
   latestPumpOn = false;
-  digitalWrite(PUMP_PIN, LOW);    // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW); // change to HIGH if your module is inverted
 }
 
 // -------------------- SENSOR + LOGIC UPDATE --------------------
@@ -471,20 +676,35 @@ void updateSensorsAndLogic() {
   latestMoisturePct = smoothMoisture(freshMoisture);
 
   latestLux = lightMeter.readLightLevel();
-  if (latestLux < 0 || latestLux > 100000) latestLux = 0;
+  if (latestLux < 0 || latestLux > 100000)
+    latestLux = 0;
 
   if (!isnan(latestTemp) && !isnan(latestHum)) {
-    diagnosis = diagnosePlant(latestMoisturePct, latestLux, latestTemp, latestHum);
+    diagnosis =
+        diagnosePlant(latestMoisturePct, latestLux, latestTemp, latestHum);
   } else {
     diagnosis = "Unknown";
   }
+
+  syncControlAndSettings();
 
   if (cooldownActive && (now - cooldownStartTime >= WATERING_COOLDOWN)) {
     cooldownActive = false;
   }
 
+  if (manualWaterRequested && !wateringActive) {
+    cooldownActive = false;
+    manualWaterRequested = false;
+    Firebase.setBool(fbdo, DEVICE_PATH + "/control/manualWaterNow", false);
+    startWatering(now);
+    pushAlertToFirebase("info", "Pump", "Manual watering command executed",
+                        "Run time: " +
+                            String((int)(configuredWateringDuration / 1000)) + "s",
+                        now);
+  }
+
   if (!wateringActive && !cooldownActive) {
-    if (diagnosis == "Water Stress") {
+    if (autoWateringEnabled && diagnosis == "Water Stress") {
       startWatering(now);
     } else {
       forcePumpOff();
@@ -492,18 +712,113 @@ void updateSensorsAndLogic() {
   }
 
   recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
+  int healthScore = computeHealthScore(diagnosis, latestMoisturePct, latestTemp,
+                                       latestHum, latestLux);
   handleBuzzerAlerts(diagnosis, latestPumpOn);
   printSensorData();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    evaluateAndPushAlerts(now);
+
+    if (!isnan(latestTemp))
+      Firebase.setFloat(fbdo, DEVICE_PATH + "/sensors/temperature", latestTemp);
+    if (!isnan(latestHum))
+      Firebase.setFloat(fbdo, DEVICE_PATH + "/sensors/humidity", latestHum);
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/sensors/moisturePct",
+                      latestMoisturePct);
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/sensors/lux", latestLux);
+    Firebase.setString(fbdo, DEVICE_PATH + "/status/diagnosis", diagnosis);
+    Firebase.setString(fbdo, DEVICE_PATH + "/status/recommendation",
+                       recommendation);
+    Firebase.setBool(fbdo, DEVICE_PATH + "/status/pumpActive", latestPumpOn);
+    Firebase.setInt(fbdo, DEVICE_PATH + "/status/healthScore", healthScore);
+    Firebase.setBool(fbdo, DEVICE_PATH + "/control/autoWatering",
+                     autoWateringEnabled);
+    Firebase.setInt(fbdo, DEVICE_PATH + "/control/pumpDurationSeconds",
+                    configuredWateringDuration / 1000);
+
+    pushHistorySnapshot(now, healthScore);
+  }
 }
 
 // -------------------- SETUP --------------------
 
 void setup() {
   Serial.begin(115200);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  int wifi_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
+    Serial.print(".");
+    delay(500);
+    wifi_attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected to Wi-Fi!");
+  } else {
+    Serial.println("Wi-Fi connection failed.");
+  }
+
+  config.host = FIREBASE_HOST;
+  config.api_key = FIREBASE_AUTH;
+  config.signer.tokens.legacy_token =
+      FIREBASE_AUTH; // Provide API key as both to ensure compatibility
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (!Firebase.getBool(fbdo, DEVICE_PATH + "/control/autoWatering")) {
+    Firebase.setBool(fbdo, DEVICE_PATH + "/control/autoWatering", true);
+  }
+  if (!Firebase.getInt(fbdo, DEVICE_PATH + "/control/pumpDurationSeconds")) {
+    Firebase.setInt(fbdo, DEVICE_PATH + "/control/pumpDurationSeconds",
+                    WATERING_DURATION / 1000);
+  }
+  Firebase.setBool(fbdo, DEVICE_PATH + "/control/manualWaterNow", false);
+  if (!Firebase.getBool(fbdo, DEVICE_PATH + "/settings/notificationsEnabled")) {
+    Firebase.setBool(fbdo, DEVICE_PATH + "/settings/notificationsEnabled",
+                     true);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMin")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMin",
+                      60.0);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMax")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/soilMax",
+                      70.0);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMin")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMin",
+                      18.0);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMax")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/tempMax",
+                      27.0);
+  }
+  if (!Firebase.getFloat(fbdo,
+                         DEVICE_PATH + "/settings/thresholds/humidityMin")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/humidityMin",
+                      50.0);
+  }
+  if (!Firebase.getFloat(fbdo,
+                         DEVICE_PATH + "/settings/thresholds/humidityMax")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/humidityMax",
+                      80.0);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMin")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMin",
+                      5000.0);
+  }
+  if (!Firebase.getFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMax")) {
+    Firebase.setFloat(fbdo, DEVICE_PATH + "/settings/thresholds/lightMax",
+                      5500.0);
+  }
+
   dht.begin();
 
   pinMode(PUMP_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, LOW);   // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW); // change to HIGH if your module is inverted
 
   pinMode(RISK_BUZZER_PIN, OUTPUT);
   pinMode(WATER_BUZZER_PIN, OUTPUT);
@@ -522,7 +837,8 @@ void setup() {
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED NOT FOUND");
-    while (true);
+    while (true)
+      ;
   }
 
   screenTimer = millis();
@@ -545,11 +861,13 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  updateOLED(latestTemp, latestHum, latestMoisturePct, latestLux, diagnosis, recommendation);
+  updateOLED(latestTemp, latestHum, latestMoisturePct, latestLux, diagnosis,
+             recommendation);
 
-  if (wateringActive && (now - wateringStartTime >= WATERING_DURATION)) {
+  if (wateringActive && (now - wateringStartTime >= configuredWateringDuration)) {
     stopWateringAndStartCooldown(now);
-    recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
+    recommendation =
+        getRecommendation(diagnosis, wateringActive, cooldownActive);
   }
 
   if (now - sensorTimer >= SENSOR_INTERVAL) {
