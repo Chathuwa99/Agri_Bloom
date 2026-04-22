@@ -1,9 +1,36 @@
-#include <Wire.h>
-#include <BH1750.h>
-#include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <BH1750.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <math.h>
 
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+#include "model.h"
+#include "scaler_params.h"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/tflite_bridge/micro_error_reporter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+// -------------------- WIFI + FIREBASE --------------------
+#define WIFI_SSID "Dialog 4G 635"
+#define WIFI_PASSWORD "1c915bDF"
+
+#define FIREBASE_API_KEY "AIzaSyDo20_bhC1QcwWB86yiZA2mjvo9uDw1aC8"
+#define FIREBASE_DATABASE_URL "https://agri-bloom-59b2a-default-rtdb.firebaseio.com/"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// -------------------- PINS --------------------
 #define DHTPIN 18
 #define DHTTYPE DHT22
 #define SOIL_PIN 1
@@ -24,16 +51,18 @@
 #define SOIL_SAMPLES 30
 
 // -------------------- TIMERS --------------------
-const unsigned long STARTUP_DURATION   = 5000;   // 5 sec startup screen
-const unsigned long SCREEN_DURATION    = 5000;   // 5 sec per OLED screen
-const unsigned long SENSOR_INTERVAL    = 30000;  // 30 sec sensor read/print
-const unsigned long WATERING_DURATION  = 5000;   // 5 sec motor ON
-const unsigned long WATERING_COOLDOWN  = 55000;  // 55 sec wait after watering
+const unsigned long STARTUP_DURATION   = 5000;
+const unsigned long SCREEN_DURATION    = 5000;
+const unsigned long SENSOR_INTERVAL    = 30000;
+const unsigned long WATERING_DURATION  = 5000;
+const unsigned long WATERING_COOLDOWN  = 55000;
 
+// -------------------- OBJECTS --------------------
 DHT dht(DHTPIN, DHTTYPE);
 BH1750 lightMeter;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
+// -------------------- STATE --------------------
 String diagnosis = "Unknown";
 String recommendation = "Monitor plant conditions";
 
@@ -50,6 +79,7 @@ bool startupDone = false;
 
 bool wateringActive = false;
 bool cooldownActive = false;
+int waterStressCount = 0;
 
 // latest sensor values
 float latestTemp = NAN;
@@ -59,8 +89,115 @@ float latestLux = 0.0;
 int latestRawSoil = 0;
 bool latestPumpOn = false;
 
-// -------------------- HELPERS --------------------
+const String DEVICE_PATH = "/AgriBloom/device_001";
 
+unsigned long configuredWateringDuration = WATERING_DURATION;
+bool autoWateringEnabled = true;
+bool manualWaterRequested = false;
+
+float thresholdSoilMin = 60.0;
+float thresholdSoilMax = 70.0;
+float thresholdTempMin = 18.0;
+float thresholdTempMax = 27.0;
+float thresholdHumidityMin = 50.0;
+float thresholdHumidityMax = 80.0;
+float thresholdLightMin = 5000.0;
+float thresholdLightMax = 5500.0;
+
+unsigned long lastSoilAlertAt = 0;
+unsigned long lastTempAlertAt = 0;
+unsigned long lastHumidityAlertAt = 0;
+unsigned long lastLightAlertAt = 0;
+unsigned long lastDiagnosisAlertAt = 0;
+const unsigned long ALERT_THROTTLE = 120000;
+
+// -------------------- TFLITE GLOBALS --------------------
+namespace {
+  tflite::MicroErrorReporter micro_error_reporter;
+  tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+  const tflite::Model* model = nullptr;
+  tflite::MicroInterpreter* interpreter = nullptr;
+  TfLiteTensor* input_tensor = nullptr;
+  TfLiteTensor* output_tensor = nullptr;
+
+  constexpr int kTensorArenaSize = 8 * 1024;
+  uint8_t tensor_arena[kTensorArenaSize];
+}
+
+// -------------------- WELFORD GLOBALS --------------------
+uint32_t welf_count = 0;
+
+float welf_mean[4] = {
+  SENSOR_MEANS[0],
+  SENSOR_MEANS[1],
+  SENSOR_MEANS[2],
+  SENSOR_MEANS[3]
+};
+
+float welf_m2[4] = {0, 0, 0, 0};
+
+float welf_variance[4] = {
+  SENSOR_STDS[0] * SENSOR_STDS[0],
+  SENSOR_STDS[1] * SENSOR_STDS[1],
+  SENSOR_STDS[2] * SENSOR_STDS[2],
+  SENSOR_STDS[3] * SENSOR_STDS[3]
+};
+
+#define WELFORD_SAVE_EVERY 50
+
+// -------------------- FIREBASE HELPERS --------------------
+bool firebaseReadyForRTDB() {
+  return WiFi.status() == WL_CONNECTED && Firebase.ready() && signupOK;
+}
+
+bool dbSetString(const String &path, const String &value) {
+  if (!firebaseReadyForRTDB()) return false;
+  return Firebase.RTDB.setString(&fbdo, path.c_str(), value);
+}
+
+bool dbSetFloat(const String &path, float value) {
+  if (!firebaseReadyForRTDB()) return false;
+  return Firebase.RTDB.setFloat(&fbdo, path.c_str(), value);
+}
+
+bool dbSetInt(const String &path, int value) {
+  if (!firebaseReadyForRTDB()) return false;
+  return Firebase.RTDB.setInt(&fbdo, path.c_str(), value);
+}
+
+bool dbSetBool(const String &path, bool value) {
+  if (!firebaseReadyForRTDB()) return false;
+  return Firebase.RTDB.setBool(&fbdo, path.c_str(), value);
+}
+
+bool dbGetBool(const String &path, bool &outValue) {
+  if (!firebaseReadyForRTDB()) return false;
+  if (Firebase.RTDB.getBool(&fbdo, path.c_str())) {
+    outValue = fbdo.boolData();
+    return true;
+  }
+  return false;
+}
+
+bool dbGetInt(const String &path, int &outValue) {
+  if (!firebaseReadyForRTDB()) return false;
+  if (Firebase.RTDB.getInt(&fbdo, path.c_str())) {
+    outValue = fbdo.intData();
+    return true;
+  }
+  return false;
+}
+
+bool dbGetFloat(const String &path, float &outValue) {
+  if (!firebaseReadyForRTDB()) return false;
+  if (Firebase.RTDB.getFloat(&fbdo, path.c_str())) {
+    outValue = fbdo.floatData();
+    return true;
+  }
+  return false;
+}
+
+// -------------------- HELPERS --------------------
 int readAveragedAnalog(int pin, int samples) {
   long sum = 0;
   for (int i = 0; i < samples; i++) {
@@ -82,59 +219,106 @@ float getMoisturePct(int rawSoil) {
 
 float smoothMoisture(float currentValue) {
   static float lastValue = currentValue;
-  float smoothed = (lastValue * 0.7) + (currentValue * 0.3);
+  float smoothed = (lastValue * 0.7f) + (currentValue * 0.3f);
   lastValue = smoothed;
   return smoothed;
 }
 
-// -------------------- DIAGNOSIS --------------------
+// -------------------- WELFORD FUNCTIONS --------------------
+void welfordUpdate(float moisture, float lux, float temp, float hum) {
+  float values[4] = { moisture, lux, temp, hum };
+  welf_count++;
 
+  for (int ch = 0; ch < 4; ch++) {
+    float delta = values[ch] - welf_mean[ch];
+    welf_mean[ch] += delta / welf_count;
+    float delta2 = values[ch] - welf_mean[ch];
+    welf_m2[ch] += delta * delta2;
+
+    if (welf_count > 1) {
+      welf_variance[ch] = welf_m2[ch] / welf_count;
+    }
+  }
+
+  if (welf_count % WELFORD_SAVE_EVERY == 0) {
+    Serial.println("[Welford] Learned parameters updated.");
+  }
+}
+
+// Prediction uses fixed scaler from training
+float welfordNormalise(float value, int channel) {
+  return (value - SENSOR_MEANS[channel]) / SENSOR_STDS[channel];
+}
+
+// Let Welford learn only from safer states
+bool shouldUpdateWelford(String diag) {
+  return (
+    diag == "Healthy" ||
+    diag == "Light Deficiency" ||
+    diag == "Nutrient Deficiency"
+  );
+}
+
+// -------------------- ML DIAGNOSIS --------------------
 String diagnosePlant(float moisturePct, float lux, float temp, float hum) {
-  if (moisturePct >= 0.0 && moisturePct <= 34.0) {
-    return "Water Stress";
+  if (interpreter == nullptr || input_tensor == nullptr || output_tensor == nullptr) {
+    return "Unknown";
   }
 
-  if (moisturePct >= 85.0 && moisturePct <= 100.0 &&
-      lux >= 500.0 && lux <= 2000.0 &&
-      temp >= 18.0 && temp <= 26.0 &&
-      hum >= 80.0 && hum <= 95.0) {
-    return "Root Rot Risk";
+  float n_moisture = welfordNormalise(moisturePct, 0);
+  float n_lux      = welfordNormalise(lux, 1);
+  float n_temp     = welfordNormalise(temp, 2);
+  float n_hum      = welfordNormalise(hum, 3);
+
+  float input_scale = input_tensor->params.scale;
+  int input_zero_point = input_tensor->params.zero_point;
+
+  input_tensor->data.int8[0] = (int8_t)(n_moisture / input_scale + input_zero_point);
+  input_tensor->data.int8[1] = (int8_t)(n_lux      / input_scale + input_zero_point);
+  input_tensor->data.int8[2] = (int8_t)(n_temp     / input_scale + input_zero_point);
+  input_tensor->data.int8[3] = (int8_t)(n_hum      / input_scale + input_zero_point);
+
+  TfLiteStatus status = interpreter->Invoke();
+  if (status != kTfLiteOk) {
+    Serial.println("[ML] Inference failed!");
+    return "Unknown";
   }
 
-  if (moisturePct >= 30.0 && moisturePct <= 55.0 &&
-      temp >= 32.0 && temp <= 42.0 &&
-      hum >= 20.0 && hum <= 40.0) {
-    return "Heat Stress";
+  float output_scale = output_tensor->params.scale;
+  int output_zero_point = output_tensor->params.zero_point;
+
+  float probs[7];
+  for (int i = 0; i < 7; i++) {
+    probs[i] = (output_tensor->data.int8[i] - output_zero_point) * output_scale;
   }
 
-  if (moisturePct >= 60.0 && moisturePct <= 80.0 &&
-      lux >= 300.0 && lux <= 1500.0 &&
-      temp >= 18.0 && temp <= 25.0 &&
-      hum >= 85.0 && hum <= 100.0) {
-    return "Fungal Risk";
+  int best_idx = 0;
+  float best_prob = probs[0];
+
+  for (int i = 1; i < 7; i++) {
+    if (probs[i] > best_prob) {
+      best_prob = probs[i];
+      best_idx = i;
+    }
   }
 
-  if (moisturePct >= 50.0 && moisturePct <= 70.0 &&
-      lux >= 100.0 && lux <= 999.0 &&
-      temp >= 15.0 && temp <= 25.0) {
-    return "Light Deficiency";
+  if (best_prob < 0.60f) {
+    Serial.printf("[ML] Low confidence: %.1f%% -> Unknown\n", best_prob * 100.0f);
+    return "Unknown";
   }
 
-  if (moisturePct >= 60.0 && moisturePct <= 70.0 &&
-      lux >= 3000.0 && lux <= 5000.0 &&
-      temp >= 18.0 && temp <= 27.0 &&
-      hum >= 60.0 && hum <= 80.0) {
-    return "Healthy";
-  }
+  const char* labels[7] = {
+    "Fungal Risk",
+    "Healthy",
+    "Heat Stress",
+    "Light Deficiency",
+    "Nutrient Deficiency",
+    "Root Rot Risk",
+    "Water Stress"
+  };
 
-  if (moisturePct >= 40.0 && moisturePct <= 70.0 &&
-      lux >= 500.0 && lux <= 4500.0 &&
-      temp >= 18.0 && temp <= 27.0 &&
-      hum >= 40.0 && hum <= 85.0) {
-    return "Nutrient Deficiency";
-  }
-
-  return "Unknown";
+  Serial.printf("[ML] Diagnosis: %s (%.1f%%)\n", labels[best_idx], best_prob * 100.0f);
+  return String(labels[best_idx]);
 }
 
 bool isRiskDiagnosis(String diagnosis) {
@@ -174,8 +358,159 @@ String getRecommendation(String diagnosis, bool wateringNow, bool cooldownNow) {
   return "Monitor conditions";
 }
 
-// -------------------- BUZZERS --------------------
+int computeHealthScore(String currentDiagnosis, float moisturePct, float temp, float hum,
+                       float lux) {
+  int score = 100;
 
+  if (currentDiagnosis == "Water Stress") score -= 28;
+  else if (currentDiagnosis == "Root Rot Risk") score -= 30;
+  else if (currentDiagnosis == "Heat Stress") score -= 24;
+  else if (currentDiagnosis == "Fungal Risk") score -= 26;
+  else if (currentDiagnosis == "Light Deficiency") score -= 16;
+  else if (currentDiagnosis == "Nutrient Deficiency") score -= 14;
+  else if (currentDiagnosis == "Unknown") score -= 20;
+
+  if (moisturePct < thresholdSoilMin) score -= 6;
+  if (moisturePct > thresholdSoilMax) score -= 6;
+  if (temp < thresholdTempMin) score -= 5;
+  if (temp > thresholdTempMax) score -= 8;
+  if (hum < thresholdHumidityMin || hum > thresholdHumidityMax) score -= 5;
+  if (lux < thresholdLightMin || lux > thresholdLightMax) score -= 5;
+
+  if (score < 0) score = 0;
+  if (score > 100) score = 100;
+
+  return score;
+}
+
+bool shouldSendAlert(unsigned long &lastSentAt, unsigned long now) {
+  if (now - lastSentAt < ALERT_THROTTLE) return false;
+  lastSentAt = now;
+  return true;
+}
+
+void pushAlertToFirebase(String type, String sensor, String message, String value,
+                         unsigned long now) {
+  String alertId = String(now) + "_" + String(random(100, 999));
+  String basePath = DEVICE_PATH + "/alerts/" + alertId;
+
+  dbSetString(basePath + "/type", type);
+  dbSetString(basePath + "/sensor", sensor);
+  dbSetString(basePath + "/message", message);
+  dbSetString(basePath + "/value", value);
+  dbSetString(basePath + "/time", "T+" + String(now / 1000) + "s");
+  dbSetInt(basePath + "/createdAt", (int)now);
+  dbSetBool(basePath + "/acknowledged", false);
+}
+
+void pushHistorySnapshot(unsigned long now, int healthScore) {
+  String pointPath = DEVICE_PATH + "/history/" + String(now);
+
+  if (!isnan(latestTemp)) dbSetFloat(pointPath + "/temperature", latestTemp);
+  if (!isnan(latestHum)) dbSetFloat(pointPath + "/humidity", latestHum);
+  dbSetFloat(pointPath + "/moisturePct", latestMoisturePct);
+  dbSetFloat(pointPath + "/lux", latestLux);
+  dbSetInt(pointPath + "/health", healthScore);
+  dbSetString(pointPath + "/diagnosis", diagnosis);
+  dbSetBool(pointPath + "/pumpActive", latestPumpOn);
+  dbSetInt(pointPath + "/createdAt", (int)now);
+}
+
+void syncControlAndSettings() {
+  if (!firebaseReadyForRTDB()) return;
+
+  bool boolValue;
+  int intValue;
+  float floatValue;
+
+  if (dbGetBool(DEVICE_PATH + "/control/autoWatering", boolValue)) {
+    autoWateringEnabled = boolValue;
+  }
+
+  if (dbGetInt(DEVICE_PATH + "/control/pumpDurationSeconds", intValue)) {
+    if (intValue >= 1 && intValue <= 12) {
+      configuredWateringDuration = (unsigned long)intValue * 1000UL;
+    }
+  }
+
+  if (dbGetBool(DEVICE_PATH + "/control/manualWaterNow", boolValue)) {
+    manualWaterRequested = boolValue;
+  }
+
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/soilMin", floatValue)) {
+    thresholdSoilMin = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/soilMax", floatValue)) {
+    thresholdSoilMax = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/tempMin", floatValue)) {
+    thresholdTempMin = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/tempMax", floatValue)) {
+    thresholdTempMax = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/humidityMin", floatValue)) {
+    thresholdHumidityMin = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/humidityMax", floatValue)) {
+    thresholdHumidityMax = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/lightMin", floatValue)) {
+    thresholdLightMin = floatValue;
+  }
+  if (dbGetFloat(DEVICE_PATH + "/settings/thresholds/lightMax", floatValue)) {
+    thresholdLightMax = floatValue;
+  }
+}
+
+void evaluateAndPushAlerts(unsigned long now) {
+  if (latestMoisturePct < thresholdSoilMin &&
+      shouldSendAlert(lastSoilAlertAt, now)) {
+    pushAlertToFirebase(
+        "warning", "Soil Moisture",
+        "Soil moisture is below optimal range",
+        String(latestMoisturePct, 1) + " (Threshold: " + String(thresholdSoilMin, 1) + ")",
+        now);
+  }
+
+  if (!isnan(latestTemp) && latestTemp > thresholdTempMax &&
+      shouldSendAlert(lastTempAlertAt, now)) {
+    pushAlertToFirebase(
+        "critical", "Temperature",
+        "Temperature is above safe threshold",
+        String(latestTemp, 1) + " (Threshold: " + String(thresholdTempMax, 1) + ")",
+        now);
+  }
+
+  if (!isnan(latestHum) &&
+      (latestHum < thresholdHumidityMin || latestHum > thresholdHumidityMax) &&
+      shouldSendAlert(lastHumidityAlertAt, now)) {
+    pushAlertToFirebase(
+        "warning", "Humidity",
+        "Humidity is outside configured range",
+        String(latestHum, 1) + " (Range: " + String(thresholdHumidityMin, 1) + "-" +
+            String(thresholdHumidityMax, 1) + ")",
+        now);
+  }
+
+  if (latestLux < thresholdLightMin &&
+      shouldSendAlert(lastLightAlertAt, now)) {
+    pushAlertToFirebase(
+        "warning", "Light",
+        "Light intensity dropped below minimum",
+        String(latestLux, 0) + " (Threshold: " + String(thresholdLightMin, 0) + ")",
+        now);
+  }
+
+  if (isRiskDiagnosis(diagnosis) &&
+      shouldSendAlert(lastDiagnosisAlertAt, now)) {
+    pushAlertToFirebase("critical", "Diagnosis",
+                        "Plant risk detected by diagnosis engine",
+                        diagnosis, now);
+  }
+}
+
+// -------------------- BUZZERS --------------------
 void beepRiskAlert() {
   for (int i = 0; i < 3; i++) {
     digitalWrite(RISK_BUZZER_PIN, HIGH);
@@ -208,7 +543,6 @@ void handleBuzzerAlerts(String currentDiagnosis, bool pumpOn) {
 }
 
 // -------------------- SERIAL --------------------
-
 void printLine() {
   Serial.println("============================================================");
 }
@@ -253,12 +587,17 @@ void printSensorData() {
   Serial.print("cooldown      : ");
   Serial.println(cooldownActive ? "ACTIVE" : "READY");
 
+  Serial.print("water_stress_count : ");
+  Serial.println(waterStressCount);
+
+  Serial.print("welford_count : ");
+  Serial.println(welf_count);
+
   printLine();
   Serial.println();
 }
 
 // -------------------- OLED --------------------
-
 void drawLeafIconBig(int x, int y) {
   display.drawRoundRect(x, y, 18, 12, 6, WHITE);
   display.drawLine(x + 9, y + 6, x + 9, y + 16, WHITE);
@@ -436,13 +775,12 @@ void updateOLED(float temp, float hum, float moisturePct, float lux,
 }
 
 // -------------------- PUMP CONTROL --------------------
-
 void startWatering(unsigned long now) {
   wateringActive = true;
   cooldownActive = false;
   wateringStartTime = now;
   latestPumpOn = true;
-  digitalWrite(PUMP_PIN, HIGH);   // change to LOW if your module is inverted
+  digitalWrite(PUMP_PIN, HIGH);
 }
 
 void stopWateringAndStartCooldown(unsigned long now) {
@@ -450,16 +788,15 @@ void stopWateringAndStartCooldown(unsigned long now) {
   cooldownActive = true;
   cooldownStartTime = now;
   latestPumpOn = false;
-  digitalWrite(PUMP_PIN, LOW);    // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW);
 }
 
 void forcePumpOff() {
   latestPumpOn = false;
-  digitalWrite(PUMP_PIN, LOW);    // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW);
 }
 
 // -------------------- SENSOR + LOGIC UPDATE --------------------
-
 void updateSensorsAndLogic() {
   unsigned long now = millis();
 
@@ -475,35 +812,87 @@ void updateSensorsAndLogic() {
 
   if (!isnan(latestTemp) && !isnan(latestHum)) {
     diagnosis = diagnosePlant(latestMoisturePct, latestLux, latestTemp, latestHum);
+
+    if (shouldUpdateWelford(diagnosis)) {
+      welfordUpdate(latestMoisturePct, latestLux, latestTemp, latestHum);
+    }
   } else {
     diagnosis = "Unknown";
+  }
+
+  syncControlAndSettings();
+
+  if (diagnosis == "Water Stress") {
+    waterStressCount++;
+  } else {
+    waterStressCount = 0;
   }
 
   if (cooldownActive && (now - cooldownStartTime >= WATERING_COOLDOWN)) {
     cooldownActive = false;
   }
 
+  if (manualWaterRequested && !wateringActive) {
+    cooldownActive = false;
+    manualWaterRequested = false;
+    dbSetBool(DEVICE_PATH + "/control/manualWaterNow", false);
+    startWatering(now);
+    pushAlertToFirebase("info", "Pump", "Manual watering command executed",
+                        "Run time: " + String((int)(configuredWateringDuration / 1000)) + "s",
+                        now);
+    waterStressCount = 0;
+  }
+
   if (!wateringActive && !cooldownActive) {
-    if (diagnosis == "Water Stress") {
-      startWatering(now);
+    if (autoWateringEnabled) {
+      if (manualWaterRequested) {
+        // handled above
+      } else if (waterStressCount >= 2) {
+        startWatering(now);
+        waterStressCount = 0;
+      } else {
+        forcePumpOff();
+      }
     } else {
       forcePumpOff();
     }
   }
 
   recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
+  int healthScore = computeHealthScore(diagnosis, latestMoisturePct, latestTemp,
+                                       latestHum, latestLux);
+
   handleBuzzerAlerts(diagnosis, latestPumpOn);
   printSensorData();
+
+  if (firebaseReadyForRTDB()) {
+    evaluateAndPushAlerts(now);
+
+    if (!isnan(latestTemp)) dbSetFloat(DEVICE_PATH + "/sensors/temperature", latestTemp);
+    if (!isnan(latestHum)) dbSetFloat(DEVICE_PATH + "/sensors/humidity", latestHum);
+    dbSetFloat(DEVICE_PATH + "/sensors/moisturePct", latestMoisturePct);
+    dbSetFloat(DEVICE_PATH + "/sensors/lux", latestLux);
+
+    dbSetString(DEVICE_PATH + "/status/diagnosis", diagnosis);
+    dbSetString(DEVICE_PATH + "/status/recommendation", recommendation);
+    dbSetBool(DEVICE_PATH + "/status/pumpActive", latestPumpOn);
+    dbSetInt(DEVICE_PATH + "/status/healthScore", healthScore);
+
+    dbSetBool(DEVICE_PATH + "/control/autoWatering", autoWateringEnabled);
+    dbSetInt(DEVICE_PATH + "/control/pumpDurationSeconds",
+             configuredWateringDuration / 1000);
+
+    pushHistorySnapshot(now, healthScore);
+  }
 }
 
 // -------------------- SETUP --------------------
-
 void setup() {
   Serial.begin(115200);
   dht.begin();
 
   pinMode(PUMP_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, LOW);   // change to HIGH if your module is inverted
+  digitalWrite(PUMP_PIN, LOW);
 
   pinMode(RISK_BUZZER_PIN, OUTPUT);
   pinMode(WATER_BUZZER_PIN, OUTPUT);
@@ -513,6 +902,112 @@ void setup() {
   analogReadResolution(12);
 
   Wire.begin(I2C_SDA, I2C_SCL);
+
+  model = tflite::GetModel(agri_bloom_model_data);
+
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("[ML] Model schema version mismatch!");
+    while (true);
+  }
+
+  static tflite::MicroMutableOpResolver<5> resolver;
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
+  resolver.AddRelu();
+  resolver.AddQuantize();
+  resolver.AddDequantize();
+
+  static tflite::MicroInterpreter static_interpreter(
+    model, resolver, tensor_arena, kTensorArenaSize
+  );
+
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("[ML] AllocateTensors failed!");
+    while (true);
+  }
+
+  input_tensor = interpreter->input(0);
+  output_tensor = interpreter->output(0);
+
+  Serial.printf("[ML] TFLite ready. Input: %d  Output: %d\n",
+                input_tensor->dims->data[1],
+                output_tensor->dims->data[1]);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  int wifi_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
+    Serial.print(".");
+    delay(500);
+    wifi_attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected to Wi-Fi!");
+  } else {
+    Serial.println("Wi-Fi connection failed.");
+  }
+
+  config.api_key = FIREBASE_API_KEY;
+  config.database_url = FIREBASE_DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    signupOK = true;
+    Serial.println("Firebase signUp OK");
+  } else {
+    signupOK = false;
+    Serial.print("Firebase signUp failed: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (signupOK) {
+    bool b;
+    float f;
+    int i;
+
+    if (!dbGetBool(DEVICE_PATH + "/control/autoWatering", b)) {
+      dbSetBool(DEVICE_PATH + "/control/autoWatering", true);
+    }
+    if (!dbGetInt(DEVICE_PATH + "/control/pumpDurationSeconds", i)) {
+      dbSetInt(DEVICE_PATH + "/control/pumpDurationSeconds", WATERING_DURATION / 1000);
+    }
+
+    dbSetBool(DEVICE_PATH + "/control/manualWaterNow", false);
+
+    if (!dbGetBool(DEVICE_PATH + "/settings/notificationsEnabled", b)) {
+      dbSetBool(DEVICE_PATH + "/settings/notificationsEnabled", true);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/soilMin", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/soilMin", 60.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/soilMax", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/soilMax", 70.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/tempMin", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/tempMin", 18.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/tempMax", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/tempMax", 27.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/humidityMin", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/humidityMin", 50.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/humidityMax", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/humidityMax", 80.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/lightMin", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/lightMin", 5000.0);
+    }
+    if (!dbGetFloat(DEVICE_PATH + "/settings/thresholds/lightMax", f)) {
+      dbSetFloat(DEVICE_PATH + "/settings/thresholds/lightMax", 5500.0);
+    }
+  }
 
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
     Serial.println("BH1750 STARTED SUCCESSFULLY.");
@@ -534,20 +1029,19 @@ void setup() {
   printLine();
   Serial.println("              SMART PLANT MONITORING SYSTEM");
   printLine();
-  Serial.println(" OLED + BH1750 + DHT22 + SOIL + PUMP + 2 BUZZERS");
+  Serial.println(" OLED + BH1750 + DHT22 + SOIL + PUMP + 2 BUZZERS + ML + FIREBASE");
   printLine();
 
   updateSensorsAndLogic();
 }
 
 // -------------------- LOOP --------------------
-
 void loop() {
   unsigned long now = millis();
 
   updateOLED(latestTemp, latestHum, latestMoisturePct, latestLux, diagnosis, recommendation);
 
-  if (wateringActive && (now - wateringStartTime >= WATERING_DURATION)) {
+  if (wateringActive && (now - wateringStartTime >= configuredWateringDuration)) {
     stopWateringAndStartCooldown(now);
     recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
   }
