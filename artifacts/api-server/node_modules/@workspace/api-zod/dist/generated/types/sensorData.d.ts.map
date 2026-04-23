@@ -1,0 +1,1 @@
+{"version":3,"file":"sensorData.d.ts","sourceRoot":"","sources":["../../../src/generated/types/sensorData.ts"],"names":[],"mappings":"AAAA;;;;;;GAMG;AAEH,MAAM,WAAW,UAAU;IACzB,uCAAuC;IACvC,YAAY,EAAE,MAAM,CAAC;IACrB,6BAA6B;IAC7B,WAAW,EAAE,MAAM,CAAC;IACpB,kCAAkC;IAClC,QAAQ,EAAE,MAAM,CAAC;IACjB,6BAA6B;IAC7B,cAAc,EAAE,MAAM,CAAC;IACvB,SAAS,EAAE,IAAI,CAAC;CACjB"}

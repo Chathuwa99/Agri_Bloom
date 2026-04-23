@@ -1,0 +1,49 @@
+{
+  "sensorHistory": [
+    { "day": "Mar 30", "soil": 72, "temp": 22.1, "humidity": 64, "light": 4200, "health": 80 },
+    { "day": "Mar 31", "soil": 74, "temp": 23.2, "humidity": 65, "light": 3580, "health": 81 },
+    { "day": "Apr 1", "soil": 67, "temp": 24.3, "humidity": 68, "light": 4100, "health": 83 },
+    { "day": "Apr 2", "soil": 69, "temp": 25, "humidity": 66, "light": 4480, "health": 84 },
+    { "day": "Apr 3", "soil": 76, "temp": 24.2, "humidity": 67, "light": 3810, "health": 85 },
+    { "day": "Apr 4", "soil": 74, "temp": 23.8, "humidity": 73, "light": 5020, "health": 86 },
+    { "day": "Apr 5", "soil": 68, "temp": 23.3, "humidity": 72, "light": 4782, "health": 84 }
+  ],
+  "alerts": [
+    {
+      "id": 1,
+      "type": "warning",
+      "sensor": "Soil Moisture",
+      "message": "Soil moisture is below optimal range",
+      "value": "52 (Threshold: 60)",
+      "time": "Apr 5, 10:41 AM",
+      "acknowledged": false
+    },
+    {
+      "id": 2,
+      "type": "info",
+      "sensor": "Pump",
+      "message": "Auto-watering cycle completed successfully",
+      "value": "Run time: 10s",
+      "time": "Apr 5, 8:44 AM",
+      "acknowledged": true
+    },
+    {
+      "id": 3,
+      "type": "critical",
+      "sensor": "Temperature",
+      "message": "Temperature approaching upper limit",
+      "value": "26.6 (Threshold: 27)",
+      "time": "Apr 5, 9:46 AM",
+      "acknowledged": false
+    },
+    {
+      "id": 4,
+      "type": "warning",
+      "sensor": "Light",
+      "message": "Light intensity dropped below minimum",
+      "value": "2800 (Threshold: 5000)",
+      "time": "Apr 5, 6:45 AM",
+      "acknowledged": false
+    }
+  ]
+}
