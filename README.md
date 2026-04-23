@@ -80,6 +80,9 @@ Agri-Bloom is a low-cost device that monitors tomato seedlings from week 1 to we
 }
 ```
 
+---
+
+
 ## 🚀 Run Backend
 
 Follow these steps to start the backend server:
@@ -92,10 +95,12 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 Open the dashboard
 Go to: http://localhost:8000
 
+---
+
 
 ### 🧠 **Enhanced Diagnosis Logic Table**
 
-```markdown
+
 ## 🧠 Diagnosis Logic
 
 The ESP32 uses a rule-based system (or optional ML model) to classify plant health:
@@ -111,7 +116,10 @@ The ESP32 uses a rule-based system (or optional ML model) to classify plant heal
 | ✅ Healthy | All parameters within optimal range | Maintain current care |
 
 **Note:** All thresholds can be adjusted from the dashboard settings and will sync to the ESP32 automatically.
-```
+
+
+---
+
 
 ## 🗺️ Future Improvements
 
@@ -130,10 +138,18 @@ Planned enhancements for the project:
 ### 🤝 Contributing
 Feel free to open issues or submit PRs for any of these improvements!
 
+
+---
+
+
 ## Main components
 
 - `Agri_bloom.ino` - ESP32 firmware (sensors, diagnosis, irrigation, Firebase sync)
 - `frontend/` - React dashboard (Firebase auth + realtime monitoring/control UI)
+
+
+---
+
 
 ## Firebase data paths used
 
