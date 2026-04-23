@@ -1,3 +1,4 @@
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <BH1750.h>
@@ -54,6 +55,7 @@ bool signupOK = false;
 const unsigned long STARTUP_DURATION   = 5000;
 const unsigned long SCREEN_DURATION    = 5000;
 const unsigned long SENSOR_INTERVAL    = 30000;
+const unsigned long CONTROL_INTERVAL   = 1000;
 const unsigned long WATERING_DURATION  = 5000;
 const unsigned long WATERING_COOLDOWN  = 55000;
 
@@ -71,6 +73,7 @@ bool lastPumpOn = false;
 
 unsigned long screenTimer = 0;
 unsigned long sensorTimer = 0;
+unsigned long controlTimer = 0;
 unsigned long wateringStartTime = 0;
 unsigned long cooldownStartTime = 0;
 
@@ -91,7 +94,8 @@ bool latestPumpOn = false;
 
 const String DEVICE_PATH = "/AgriBloom/device_001";
 
-unsigned long configuredWateringDuration = WATERING_DURATION;
+unsigned long manualWateringDuration = WATERING_DURATION;
+unsigned long activeWateringDuration = WATERING_DURATION;
 bool autoWateringEnabled = true;
 bool manualWaterRequested = false;
 
@@ -428,8 +432,8 @@ void syncControlAndSettings() {
   }
 
   if (dbGetInt(DEVICE_PATH + "/control/pumpDurationSeconds", intValue)) {
-    if (intValue >= 1 && intValue <= 12) {
-      configuredWateringDuration = (unsigned long)intValue * 1000UL;
+    if (intValue >= 1 && intValue <= 120) {
+      manualWateringDuration = (unsigned long)intValue * 1000UL;
     }
   }
 
@@ -836,9 +840,10 @@ void updateSensorsAndLogic() {
     cooldownActive = false;
     manualWaterRequested = false;
     dbSetBool(DEVICE_PATH + "/control/manualWaterNow", false);
+    activeWateringDuration = manualWateringDuration;
     startWatering(now);
     pushAlertToFirebase("info", "Pump", "Manual watering command executed",
-                        "Run time: " + String((int)(configuredWateringDuration / 1000)) + "s",
+                        "Run time: " + String((int)(manualWateringDuration / 1000)) + "s",
                         now);
     waterStressCount = 0;
   }
@@ -848,6 +853,7 @@ void updateSensorsAndLogic() {
       if (manualWaterRequested) {
         // handled above
       } else if (waterStressCount >= 2) {
+        activeWateringDuration = WATERING_DURATION;
         startWatering(now);
         waterStressCount = 0;
       } else {
@@ -880,7 +886,7 @@ void updateSensorsAndLogic() {
 
     dbSetBool(DEVICE_PATH + "/control/autoWatering", autoWateringEnabled);
     dbSetInt(DEVICE_PATH + "/control/pumpDurationSeconds",
-             configuredWateringDuration / 1000);
+             manualWateringDuration / 1000);
 
     pushHistorySnapshot(now, healthScore);
   }
@@ -976,6 +982,8 @@ void setup() {
     }
     if (!dbGetInt(DEVICE_PATH + "/control/pumpDurationSeconds", i)) {
       dbSetInt(DEVICE_PATH + "/control/pumpDurationSeconds", WATERING_DURATION / 1000);
+    } else if (i >= 1 && i <= 60) {
+      manualWateringDuration = (unsigned long)i * 1000UL;
     }
 
     dbSetBool(DEVICE_PATH + "/control/manualWaterNow", false);
@@ -1022,6 +1030,7 @@ void setup() {
 
   screenTimer = millis();
   sensorTimer = millis();
+  controlTimer = millis();
 
   showStartupScreen();
 
@@ -1041,7 +1050,26 @@ void loop() {
 
   updateOLED(latestTemp, latestHum, latestMoisturePct, latestLux, diagnosis, recommendation);
 
-  if (wateringActive && (now - wateringStartTime >= configuredWateringDuration)) {
+  if (now - controlTimer >= CONTROL_INTERVAL) {
+    controlTimer = now;
+    syncControlAndSettings();
+  }
+
+  if (!wateringActive && manualWaterRequested) {
+    cooldownActive = false;
+    manualWaterRequested = false;
+    dbSetBool(DEVICE_PATH + "/control/manualWaterNow", false);
+    activeWateringDuration = manualWateringDuration;
+    startWatering(now);
+    pushAlertToFirebase("info", "Pump", "Manual watering command executed",
+                        "Run time: " + String((int)(manualWateringDuration / 1000)) + "s",
+                        now);
+    waterStressCount = 0;
+    recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
+    handleBuzzerAlerts(diagnosis, latestPumpOn);
+  }
+
+  if (wateringActive && (now - wateringStartTime >= activeWateringDuration)) {
     stopWateringAndStartCooldown(now);
     recommendation = getRecommendation(diagnosis, wateringActive, cooldownActive);
   }
