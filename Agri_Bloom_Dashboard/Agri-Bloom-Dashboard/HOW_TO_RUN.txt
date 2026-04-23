@@ -1,0 +1,79 @@
+Agri_Bloom Dashboard — How to Run Locally (Windows)
+=====================================================
+
+You DO NOT need Node.js, pnpm, or npm. The React frontend is already built
+and lives in the dist/public/ folder. You only need Python.
+
+ONE-TIME SETUP
+--------------
+1. Make sure Python 3.10 or newer is installed.
+2. Open PowerShell in this folder (the folder containing app.py).
+3. Install the Python dependencies:
+
+       pip install fastapi "uvicorn[standard]" requests
+
+
+RUN THE APP
+-----------
+From this folder in PowerShell:
+
+       python -m uvicorn app:app --host 0.0.0.0 --port 8000
+
+Then open your browser to:
+
+       http://localhost:8000
+
+
+FIREBASE SETUP
+--------------
+This build talks to your Firebase Realtime Database at:
+
+       https://agri-bloom-59b2a-default-rtdb.firebaseio.com
+
+If you ever need to point at a different database, set FIREBASE_URL
+before launching uvicorn:
+
+       $env:FIREBASE_URL = "https://your-other-db.firebaseio.com"
+       python -m uvicorn app:app --host 0.0.0.0 --port 8000
+
+If your database requires a legacy database secret, also set:
+
+       $env:FIREBASE_AUTH = "your-database-secret"
+
+The dashboard expects this Firebase data layout (the ESP32 writes most of it):
+
+    /agri-bloom
+        /current
+            moisture: 0-100
+            temperature: celsius
+            humidity: 0-100
+            light: lux-ish
+            timestamp: unix seconds (optional)
+        /history
+            <auto-id>: { same fields as /current }
+        /commands
+            water_pump:
+                active: true/false
+                duration: seconds
+                requested_at: unix seconds
+
+
+ESP32 FIRMWARE
+--------------
+A sample Arduino sketch is included as esp32_sample.ino. Open it in the
+Arduino IDE, fill in your WiFi credentials and Firebase database secret
+(or service account), wire up your sensors and pump relay, and flash it
+to the ESP32. It does two things in parallel:
+
+  - pushes sensor readings to /agri-bloom/current every 5 seconds
+  - watches /agri-bloom/commands/water_pump and runs the pump when
+    the dashboard sets active=true
+
+
+CHANGING SETTINGS
+-----------------
+Edit thresholds and watering duration on the Settings page in the
+dashboard. They are saved in memory and mirrored to Firebase under
+/agri-bloom/settings, so the ESP32 can read them too.
+
+DO NOT delete the dist/public/ folder — that is the pre-built UI.

@@ -1,0 +1,17 @@
+{
+  "hosting": {
+    "site": "agri-bloom-59b2a-d4be0",
+    "public": "dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
